@@ -141,7 +141,7 @@ Serial Prediction
       -o OUTFILE, --outfile OUTFILE
                             File for predictions
       -d DEVICE, --device DEVICE
-                            Compute device to use
+                            Compute device to use. Options: 'cpu' or GPU index (0, 1, 2, etc.).
       --store_cmaps         Store contact maps for predicted pairs above `--thresh` in an h5 file
       --thresh THRESH       Positive prediction threshold - used to store contact maps and predictions in a separate file. [default: 0.5]
       --load_proc LOAD_PROC
@@ -153,16 +153,16 @@ Embedding
 
 .. code-block:: bash
 
-    usage: dscript embed [-h] --seqs SEQS --outfile OUTFILE [-d DEVICE]
+    usage: dscript embed [-h] --seqs SEQS -o OUTFILE [-d DEVICE]
 
     Generate new embeddings using pre-trained language model
 
     optional arguments:
-    -h, --help            show this help message and exit
-    --seqs SEQS           Sequences to be embedded
-    --outfile OUTFILE     h5 file to write results
+    -h, --help              show this help message and exit
+    --seqs SEQS             Sequences to be embedded
+    -o, --outfile OUTFILE   h5 file to write results
     -d DEVICE, --device DEVICE
-                            Compute device to use
+                            Compute device to use. Options: 'cpu' or GPU index (0, 1, 2, etc.).
 
 Training
 ~~~~~~~~
