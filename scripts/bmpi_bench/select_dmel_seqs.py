@@ -1,4 +1,5 @@
 import sys
+
 # args: isoform table, fasta, output table, output fasta, max length, output filtered fasta
 
 prots = set()
@@ -34,10 +35,10 @@ with open(sys.argv[2]) as fasta:
         if line[0] == ">":
             if collect:
                 collect = False
-                l = len(seqbuffer)
-                print(id, name, l, sep="\t", file=outTable)
+                length = len(seqbuffer)
+                print(id, name, length, sep="\t", file=outTable)
                 print(">" + id, seqbuffer, sep="\n", file=outFasta)
-                if filter and l <= thresh:
+                if filter and length <= thresh:
                     print(">" + id, seqbuffer, sep="\n", file=outFilter)
                 seqbuffer = ""
                 id = ""
@@ -55,10 +56,10 @@ with open(sys.argv[2]) as fasta:
         elif collect:
             seqbuffer += line.strip()
 if collect:
-    l = len(seqbuffer)
-    print(id, name, l, sep="\t", file=outTable)
+    length = len(seqbuffer)
+    print(id, name, length, sep="\t", file=outTable)
     print(">" + id, seqbuffer, sep="\n", file=outFasta)
-    if filter and l <= thresh:
+    if filter and length <= thresh:
         print(">" + id, seqbuffer, sep="\n", file=outFilter)
 outTable.close()
 outFasta.close()

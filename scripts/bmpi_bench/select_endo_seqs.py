@@ -1,4 +1,5 @@
 import sys
+
 # args: fasta, min length, max length, output table,  output filtered fasta
 
 
@@ -16,9 +17,9 @@ with open(sys.argv[1]) as fasta:
         if line[0] == ">":
             if collect:
                 collect = False
-                l = len(seqbuffer)
-                print(name, l, sep="\t", file=outTable)
-                if l >= floor and l <= thresh:
+                length = len(seqbuffer)
+                print(name, length, sep="\t", file=outTable)
+                if length >= floor and length <= thresh:
                     print(">" + name, seqbuffer, sep="\n", file=outFilter)
                 seqbuffer = ""
                 name = ""
@@ -27,9 +28,9 @@ with open(sys.argv[1]) as fasta:
         elif collect:
             seqbuffer += line.strip()
 if collect:
-    l = len(seqbuffer)
-    print(name, l, sep="\t", file=outTable)
-    if l >= floor and l <= thresh:
+    length = len(seqbuffer)
+    print(name, length, sep="\t", file=outTable)
+    if length >= floor and length <= thresh:
         print(">" + name, seqbuffer, sep="\n", file=outFilter)
 outTable.close()
 outFilter.close()
