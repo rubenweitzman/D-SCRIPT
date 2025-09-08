@@ -44,7 +44,7 @@ dscript predict --pairs [input data] --embeddings [embedding file] --model [mode
 dscript predict --pairs data/pairs/ecoli_toy.tsv --embeddings ecoli_embed.h5 --outfile ecoli_toy_predict
 ```
 
-For inference, proteins can be divided into blocks to reduce memory usage for embeddings using `--blocks`. A GPU to use can be specified with `-d`, followed by the index of a GPU or `all` for all available GPUs.
+For inference, proteins can be divided into blocks to reduce memory usage for embeddings using `--blocks`. By default, the CPU is used; a GPU to use can be specified with `-d`, followed by the index of a GPU or `all` for all available GPUs.
 ```bash
 #Example with 16 blocks, using (using 3/16th the maximum embedding memory), and a GPU
 dscript predict --pairs data/pairs/ecoli_test.tsv --embeddings ecoli_embed.h5 --outfile ecoli_test_predict --blocks 16 -d 0
