@@ -1,0 +1,40 @@
+[project]
+name = "dscript"
+version = "2.1.0"
+description = "D-SCRIPT: protein-protein interaction prediction"
+channels = ["conda-forge", "pytorch", "nvidia"]
+platforms = ["linux-64"]
+
+[tasks]
+test = "pytest dscript/tests/"
+
+[dependencies]
+python = ">=3.10,<3.13"
+pip = "*"
+
+[pypi-dependencies]
+# Core D-SCRIPT dependencies
+numpy = "*"
+biotite = "==1.2.0"
+scipy = "*"
+pandas = "*"
+torch = ">=1.13"
+matplotlib = "*"
+seaborn = "*"
+tqdm = "*"
+scikit-learn = "*"
+h5py = "*"
+huggingface_hub = "*"
+safetensors = "*"
+loguru = "*"
+click = "*"
+
+# For eval_profluent_style script
+mosaicml-streaming = "*"
+
+# Install dscript itself in editable mode
+dscript = { path = ".", editable = true }
+
+
+
+

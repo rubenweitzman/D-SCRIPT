@@ -2,17 +2,19 @@
 """
 PPI Prediction Evaluation Script (Profluent-style) for D-SCRIPT
 
-Evaluates D-SCRIPT PPI prediction on datasets from dataset_to_eval.md.
-Loads MDS datasets from GCS and runs PPI prediction pipeline using D-SCRIPT.
+Evaluates D-SCRIPT PPI prediction on datasets with BATCHED processing
+to avoid disk space issues with large datasets.
 
-D-SCRIPT uses embeddings from Bepler+Berger protein language model and predicts
-interaction probabilities based on contact maps.
+Key features:
+- Processes data in batches (default 10K pairs per batch)
+- Deletes embeddings after each batch to save disk space
+- Combines partial results at the end
 
 Usage:
     python eval_profluent_style/eval_profluent_style.py \
-        --dataset-name alignment_skempi \
-        --model samsl/topsy_turvy_human_v1 \
-        --output-dir ./results/alignment_skempi
+        --dataset-name alignment_intact_ppi \
+        --output-dir ./results/alignment_intact_ppi \
+        --batch-size 10000
 """
 
 import os
@@ -23,6 +25,7 @@ import pickle
 import subprocess
 import shlex
 import tempfile
+import shutil
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -49,7 +52,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# Dataset paths from dataset_to_eval.md
 # Dataset paths - supports both MDS and CSV formats
 DATASET_PATHS_MDS = {
     "alignment_skempi": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/alignment_skempi",
@@ -63,13 +65,11 @@ DATASET_PATHS_MDS = {
     "human_validation_with_negatives": "gs://profluent-rweitzman/alignment/test_dataset_mds_round_2/human_validation_with_negatives",
 }
 
-# CSV paths (direct CSV format) - for datasets without MDS
 DATASET_PATHS_CSV = {
     "alignment_intact_covid": "gs://profluent-rweitzman/alignment/test_dataset_csv_round_2/alignment_intact_covid.csv",
     "alignment_virus_human": "gs://profluent-rweitzman/alignment/test_dataset_csv_round_2/alignment_virus_human.csv",
 }
 
-# Combined lookup
 DATASET_PATHS = {**DATASET_PATHS_MDS, **DATASET_PATHS_CSV}
 
 
@@ -77,6 +77,7 @@ def load_csv_dataset(csv_path: str, max_samples: Optional[int] = None) -> Tuple[
     """Load CSV dataset from GCS or local path."""
     logger.info(f"Loading CSV dataset from: {csv_path}")
     
+    local_csv = None
     if csv_path.startswith("gs://"):
         local_csv = tempfile.NamedTemporaryFile(suffix=".csv", delete=False).name
         logger.info(f"Downloading to: {local_csv}")
@@ -99,27 +100,19 @@ def load_csv_dataset(csv_path: str, max_samples: Optional[int] = None) -> Tuple[
             'data_source': row.get('data_source', 'default')
         })
     
+    # Cleanup downloaded CSV
+    if local_csv and os.path.exists(local_csv):
+        os.remove(local_csv)
+    
     return df, samples
 
 
-def load_mds_dataset(gcs_path: str, max_samples: Optional[int] = None, local_cache_dir: Optional[str] = None) -> List[Dict]:
-    """
-    Load MDS dataset from GCS.
-    
-    Args:
-        gcs_path: GCS path to MDS dataset
-        max_samples: Maximum number of samples to load (None for all)
-        local_cache_dir: Optional local directory for caching (auto-generated if None)
-    
-    Returns:
-        List of samples, each with 'sequence' and 'value' fields
-    """
+def load_mds_dataset(gcs_path: str, max_samples: Optional[int] = None) -> List[Dict]:
+    """Load MDS dataset from GCS."""
     logger.info(f"Loading MDS dataset from: {gcs_path}")
     
-    # Use temp directory for caching if not provided
-    if local_cache_dir is None:
-        local_cache_dir = tempfile.mkdtemp(prefix="mds_cache_")
-        logger.info(f"Using temporary cache directory: {local_cache_dir}")
+    local_cache_dir = tempfile.mkdtemp(prefix="mds_cache_")
+    logger.info(f"Using temporary cache directory: {local_cache_dir}")
     
     dataset = StreamingDataset(
         remote=gcs_path,
@@ -133,7 +126,6 @@ def load_mds_dataset(gcs_path: str, max_samples: Optional[int] = None, local_cac
     total_samples = len(dataset)
     logger.info(f"Dataset contains {total_samples} samples")
     
-    # Determine how many samples to load
     num_to_load = min(max_samples, total_samples) if max_samples else total_samples
     
     samples = []
@@ -148,51 +140,32 @@ def load_mds_dataset(gcs_path: str, max_samples: Optional[int] = None, local_cac
             })
             pbar.update(1)
     
+    # Cleanup MDS cache
+    shutil.rmtree(local_cache_dir, ignore_errors=True)
+    
     logger.info(f"Loaded {len(samples)} samples")
     return samples
 
 
 def extract_protein_pairs(samples: List[Dict]) -> List[Dict]:
-    """
-    Extract protein pairs from samples.
-    
-    D-SCRIPT expects pairs in TSV format with protein keys (no header).
-    
-    Returns:
-        List of dicts with 'protein1' and 'protein2' sequences
-    """
+    """Extract protein pairs from samples."""
     pairs = []
     
-    for i, sample in enumerate(tqdm(samples, desc="Extracting protein pairs", unit="samples")):
+    for i, sample in enumerate(samples):
         seq = sample['sequence']
-        
-        # Split by comma (always the separator in these datasets)
         parts = seq.split(',', 1)
         if len(parts) == 2:
             seq1, seq2 = parts[0].strip(), parts[1].strip()
             if seq1 and seq2:
-                # Use index as protein key (D-SCRIPT uses keys from FASTA)
                 pairs.append({
                     'key': f'protein_{i}',
                     'protein1': seq1,
                     'protein2': seq2,
                 })
             else:
-                logger.warning(f"Empty sequence in sample {i}")
-                pairs.append({
-                    'key': f'protein_{i}',
-                    'protein1': '',
-                    'protein2': ''
-                })
+                pairs.append({'key': f'protein_{i}', 'protein1': '', 'protein2': ''})
         else:
-            logger.warning(f"Sample {i} does not contain comma-separated pair: {seq[:50]}...")
-            pairs.append({
-                'key': f'protein_{i}',
-                'protein1': '',
-                'protein2': ''
-            })
-    
-    logger.info(f"Extracted {len(pairs)} protein pairs from {len(samples)} samples")
+            pairs.append({'key': f'protein_{i}', 'protein1': '', 'protein2': ''})
     
     return pairs
 
@@ -203,95 +176,74 @@ def create_fasta_file(pairs: List[Dict], output_path: str) -> str:
         seen_keys = set()
         for pair in pairs:
             key = pair['key']
-            # Write protein1
             if key not in seen_keys:
                 f.write(f">{key}_1\n{pair['protein1']}\n")
                 seen_keys.add(key)
-            # Write protein2 (use _2 suffix)
             key2 = f"{key}_2"
             if key2 not in seen_keys:
                 f.write(f">{key2}\n{pair['protein2']}\n")
                 seen_keys.add(key2)
-    
-    logger.info(f"Created FASTA file: {output_path} with {len(seen_keys)} sequences")
     return output_path
 
 
 def create_tsv_file(pairs: List[Dict], output_path: str) -> str:
-    """Create a TSV file from pairs in D-SCRIPT format (no header, protein1_key, protein2_key)."""
+    """Create a TSV file from pairs in D-SCRIPT format."""
     with open(output_path, 'w') as f:
         for pair in pairs:
             key = pair['key']
-            # D-SCRIPT expects keys matching FASTA headers
             f.write(f"{key}_1\t{key}_2\n")
-    
-    logger.info(f"Created TSV file: {output_path} with {len(pairs)} pairs")
     return output_path
 
 
-def run_ppi_prediction(
-    fasta_file: str,
-    pairs_tsv: str,
+def run_batch_prediction(
+    pairs: List[Dict],
     model: str,
-    output_dir: Path,
+    batch_dir: Path,
     device: str = "0",
-    embeddings_file: Optional[str] = None,
-) -> Dict:
+) -> np.ndarray:
     """
-    Run D-SCRIPT PPI prediction pipeline.
-    
-    Args:
-        fasta_file: Path to FASTA file with sequences
-        pairs_tsv: Path to TSV file with protein pairs
-        model: D-SCRIPT model name (e.g., 'samsl/topsy_turvy_human_v1') or path
-        output_dir: Output directory for results
-        device: Device for inference ('cpu' or GPU index like '0')
-        embeddings_file: Optional path to pre-computed embeddings (h5 file)
+    Run D-SCRIPT prediction on a batch of pairs.
+    Creates embeddings, runs prediction, then cleans up.
     
     Returns:
-        Dictionary with results including predictions
+        Array of prediction scores for this batch
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
+    batch_dir.mkdir(parents=True, exist_ok=True)
     
-    # Step 1: Generate embeddings if not provided
-    if embeddings_file is None:
-        logger.info("Generating embeddings from FASTA file...")
-        embeddings_file = str(output_dir / "embeddings.h5")
-        
-        # Use Python module directly instead of CLI to avoid argument parsing issues
-        try:
-            from dscript.commands.embed import add_args, main as embed_main
-            import argparse
-            
-            # Create args object
-            parser = argparse.ArgumentParser()
-            add_args(parser)
-            embed_args = parser.parse_args([
-                "--seqs", fasta_file,
-                "--outfile", embeddings_file,
-                "--device", device if device.lower() != "cpu" else "cpu"
-            ])
-            
-            embed_main(embed_args)
-            logger.info("✓ Embeddings generated successfully")
-        except Exception as e:
-            logger.error(f"Failed to generate embeddings: {e}")
-            raise
-    else:
-        logger.info(f"Using pre-computed embeddings: {embeddings_file}")
+    # Create FASTA and TSV files for this batch
+    fasta_file = str(batch_dir / "sequences.fasta")
+    pairs_tsv = str(batch_dir / "pairs.tsv")
+    embeddings_file = str(batch_dir / "embeddings.h5")
+    predictions_file = str(batch_dir / "predictions.tsv")
     
-    # Step 2: Run predictions
-    logger.info("Running D-SCRIPT predictions...")
-    predictions_file = str(output_dir / "predictions.tsv")
+    create_fasta_file(pairs, fasta_file)
+    create_tsv_file(pairs, pairs_tsv)
     
-    # Use Python module directly instead of CLI to avoid argument parsing issues
+    # Step 1: Generate embeddings
     try:
-        from dscript.commands.predict_serial import add_args, main as predict_main
+        from dscript.commands.embed import add_args as embed_add_args, main as embed_main
         import argparse
         
-        # Create args object
         parser = argparse.ArgumentParser()
-        add_args(parser)
+        embed_add_args(parser)
+        embed_args = parser.parse_args([
+            "--seqs", fasta_file,
+            "--outfile", embeddings_file,
+            "--device", device if device.lower() != "cpu" else "cpu"
+        ])
+        
+        embed_main(embed_args)
+    except Exception as e:
+        logger.error(f"Failed to generate embeddings: {e}")
+        raise
+    
+    # Step 2: Run predictions
+    try:
+        from dscript.commands.predict_serial import add_args as predict_add_args, main as predict_main
+        import argparse
+        
+        parser = argparse.ArgumentParser()
+        predict_add_args(parser)
         predict_args = parser.parse_args([
             "--pairs", pairs_tsv,
             "--embeddings", embeddings_file,
@@ -301,7 +253,6 @@ def run_ppi_prediction(
         ])
         
         predict_main(predict_args)
-        logger.info("✓ Predictions generated successfully")
     except Exception as e:
         logger.error(f"Failed to generate predictions: {e}")
         raise
@@ -309,71 +260,29 @@ def run_ppi_prediction(
     # Load predictions
     pred_file = Path(predictions_file + ".tsv")
     if pred_file.exists():
-        # D-SCRIPT outputs TSV with: protein1_key, protein2_key, score
         predictions_df = pd.read_csv(pred_file, sep="\t", header=None, names=['protein1_key', 'protein2_key', 'score'])
         predictions = predictions_df['score'].values
-        logger.info(f"Loaded {len(predictions)} predictions")
-        logger.info(f"Prediction range: {predictions.min():.4f} - {predictions.max():.4f}")
     else:
         logger.error(f"Prediction file not found: {pred_file}")
-        predictions = np.array([])
+        predictions = np.array([np.nan] * len(pairs))
     
-    return {
-        'predictions': predictions,
-        'num_pairs': len(predictions),
-    }
+    # Cleanup batch files (especially embeddings which are huge!)
+    for f in [fasta_file, pairs_tsv, embeddings_file, predictions_file, str(pred_file)]:
+        if os.path.exists(f):
+            os.remove(f)
+    
+    return predictions
 
 
 @click.command()
-@click.option(
-    "--dataset-name",
-    type=str,
-    help="Dataset name from dataset_to_eval.md (e.g., 'alignment_skempi')"
-)
-@click.option(
-    "--gcs-path",
-    type=str,
-    help="GCS path to MDS dataset (overrides dataset-name if provided)"
-)
-@click.option(
-    "--csv-path",
-    type=str,
-    help="GCS or local path to CSV file (format: sequence,value,data_source). Overrides --gcs-path"
-)
-@click.option(
-    "--model",
-    type=str,
-    default="samsl/topsy_turvy_human_v1",
-    help="D-SCRIPT model name or path. Options: "
-         "'samsl/topsy_turvy_human_v1' (recommended), "
-         "'samsl/dscript_human_v1', "
-         "'samsl/tt3d_human_v1', "
-         "or path to .pt/.sav file [default: samsl/topsy_turvy_human_v1]"
-)
-@click.option(
-    "--output-dir",
-    type=str,
-    required=True,
-    help="Output directory for results"
-)
-@click.option(
-    "--max-samples",
-    type=int,
-    default=None,
-    help="Maximum number of samples to process (for testing, None = all)"
-)
-@click.option(
-    "--device",
-    type=str,
-    default="0",
-    help="Device for D-SCRIPT model ('cpu' or GPU index like '0') [default: 0]"
-)
-@click.option(
-    "--embeddings",
-    type=str,
-    default=None,
-    help="Optional path to pre-computed embeddings (h5 file). If not provided, embeddings will be generated."
-)
+@click.option("--dataset-name", type=str, help="Dataset name (e.g., 'alignment_intact_ppi')")
+@click.option("--gcs-path", type=str, help="GCS path to MDS dataset (overrides dataset-name)")
+@click.option("--csv-path", type=str, help="GCS or local path to CSV file")
+@click.option("--model", type=str, default="samsl/topsy_turvy_human_v1", help="D-SCRIPT model")
+@click.option("--output-dir", type=str, required=True, help="Output directory")
+@click.option("--max-samples", type=int, default=None, help="Max samples (for testing)")
+@click.option("--device", type=str, default="0", help="GPU device")
+@click.option("--batch-size", type=int, default=10000, help="Batch size for processing (default: 10000 pairs)")
 def main(
     dataset_name: Optional[str],
     gcs_path: Optional[str],
@@ -382,11 +291,11 @@ def main(
     output_dir: str,
     max_samples: Optional[int],
     device: str,
-    embeddings: Optional[str],
+    batch_size: int,
 ) -> None:
-    """Run D-SCRIPT PPI prediction evaluation on MDS or CSV dataset."""
+    """Run D-SCRIPT PPI prediction with batched processing to save disk space."""
     
-    # Determine data source (CSV takes priority)
+    # Determine data source
     use_csv = False
     original_df = None
     
@@ -400,160 +309,146 @@ def main(
         data_path = DATASET_PATHS[dataset_name]
         use_csv = dataset_name in DATASET_PATHS_CSV or data_path.endswith('.csv')
     else:
-        logger.error(f"Must provide --csv-path, --gcs-path, or --dataset-name (one of: {list(DATASET_PATHS.keys())})")
+        logger.error(f"Must provide --csv-path, --gcs-path, or --dataset-name")
         sys.exit(1)
     
     logger.info("="*80)
-    logger.info("D-SCRIPT PPI Prediction Evaluation")
+    logger.info("D-SCRIPT PPI Prediction (BATCHED)")
     logger.info("="*80)
     logger.info(f"Dataset: {dataset_name or 'custom'}")
     logger.info(f"Data Path: {data_path}")
     logger.info(f"Format: {'CSV' if use_csv else 'MDS'}")
     logger.info(f"Model: {model}")
+    logger.info(f"Batch Size: {batch_size}")
     logger.info(f"Output Directory: {output_dir}")
     logger.info("="*80)
     
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
     
-    # Step 1: Load dataset (CSV or MDS)
+    # Step 1: Load dataset
+    logger.info("\n[Step 1] Loading dataset...")
     if use_csv:
-        logger.info("\n[Step 1/5] Loading CSV dataset...")
         original_df, samples = load_csv_dataset(data_path, max_samples=max_samples)
     else:
-        logger.info("\n[Step 1/5] Loading MDS dataset...")
         samples = load_mds_dataset(data_path, max_samples=max_samples)
     
     # Step 2: Extract protein pairs
-    logger.info("\n[Step 2/5] Extracting protein pairs...")
+    logger.info("\n[Step 2] Extracting protein pairs...")
     pairs = extract_protein_pairs(samples)
+    logger.info(f"Total pairs: {len(pairs)}")
     
     if len(pairs) == 0:
-        logger.error("No protein pairs extracted from samples!")
+        logger.error("No protein pairs extracted!")
         sys.exit(1)
     
-    # Step 3: Create FASTA file
-    logger.info("\n[Step 3/5] Creating FASTA file...")
-    fasta_file = str(output_path / "sequences.fasta")
-    create_fasta_file(pairs, fasta_file)
+    # Step 3: Process in batches
+    logger.info(f"\n[Step 3] Processing in batches of {batch_size}...")
     
-    # Step 4: Create TSV file for pairs
-    logger.info("\n[Step 4/5] Creating TSV file for pairs...")
-    pairs_tsv = str(output_path / "pairs.tsv")
-    create_tsv_file(pairs, pairs_tsv)
+    num_batches = (len(pairs) + batch_size - 1) // batch_size
+    all_predictions = []
     
-    # Step 5: Run PPI prediction
-    logger.info("\n[Step 5/5] Running D-SCRIPT PPI prediction...")
-    results = run_ppi_prediction(
-        fasta_file=fasta_file,
-        pairs_tsv=pairs_tsv,
-        model=model,
-        output_dir=output_path,
-        device=device,
-        embeddings_file=embeddings,
-    )
-    
-    # Step 6: Create CSV output with predictions
-    logger.info("\n[Step 6/6] Creating CSV output with predictions...")
-    
-    predictions = results['predictions']
-    
-    # If we loaded from CSV, add column to original DataFrame
-    if use_csv and original_df is not None:
-        logger.info("Adding prediction column to original CSV...")
-        output_df = original_df.copy()
+    for batch_idx in range(num_batches):
+        start_idx = batch_idx * batch_size
+        end_idx = min(start_idx + batch_size, len(pairs))
+        batch_pairs = pairs[start_idx:end_idx]
         
+        logger.info(f"\n--- Batch {batch_idx + 1}/{num_batches} (samples {start_idx}-{end_idx}) ---")
+        
+        batch_dir = output_path / f"batch_{batch_idx}"
+        
+        try:
+            batch_predictions = run_batch_prediction(
+                pairs=batch_pairs,
+                model=model,
+                batch_dir=batch_dir,
+                device=device,
+            )
+            all_predictions.extend(batch_predictions)
+            logger.info(f"✓ Batch {batch_idx + 1} complete: {len(batch_predictions)} predictions")
+        except Exception as e:
+            logger.error(f"Batch {batch_idx + 1} failed: {e}")
+            # Fill with NaN for failed batch
+            all_predictions.extend([np.nan] * len(batch_pairs))
+        finally:
+            # Cleanup batch directory
+            if batch_dir.exists():
+                shutil.rmtree(batch_dir, ignore_errors=True)
+    
+    predictions = np.array(all_predictions)
+    
+    # Step 4: Create output CSV
+    logger.info("\n[Step 4] Creating output CSV...")
+    
+    if use_csv and original_df is not None:
+        output_df = original_df.copy()
         if len(predictions) == len(output_df):
             output_df['dscript_prediction'] = predictions
         else:
-            logger.warning(f"Prediction count mismatch: {len(predictions)} vs {len(output_df)} rows")
             output_df['dscript_prediction'] = np.nan
             output_df.loc[:len(predictions)-1, 'dscript_prediction'] = predictions
     else:
-        # Build output rows from samples (MDS format)
         output_rows = []
-        for i, sample in enumerate(tqdm(samples, desc="Creating output", unit="samples")):
-            if i < len(predictions):
-                prediction_score = float(predictions[i])
-            else:
-                logger.warning(f"Could not find prediction for sample {i}")
-                prediction_score = np.nan
-            
+        for i, sample in enumerate(samples):
             row = {
                 'data_source': sample.get('data_source', ''),
                 'sequence': sample['sequence'],
                 'value': sample['value'],
-                'dscript_prediction': prediction_score,
+                'dscript_prediction': float(predictions[i]) if i < len(predictions) else np.nan,
             }
             output_rows.append(row)
-        
         output_df = pd.DataFrame(output_rows)
     
     csv_output_file = output_path / "results.csv"
     output_df.to_csv(csv_output_file, index=False)
     logger.info(f"Saved CSV results to {csv_output_file}")
-    logger.info(f"CSV contains {len(output_df)} rows with columns: {list(output_df.columns)}")
     
-    # Also save pickle for detailed analysis
+    # Save pickle
     results_file = output_path / "ppi_results.pkl"
-    logger.info(f"\nSaving detailed results to {results_file}")
-    
-    # Add metadata to results
-    results['dataset_name'] = dataset_name or 'custom'
-    results['data_path'] = data_path
-    results['num_samples'] = len(samples)
-    results['num_pairs'] = len(pairs)
-    
+    results = {
+        'predictions': predictions,
+        'num_pairs': len(pairs),
+        'dataset_name': dataset_name or 'custom',
+        'data_path': data_path,
+        'num_samples': len(samples),
+    }
     with open(results_file, "wb") as f:
         pickle.dump(results, f)
     
-    # Print summary
+    # Summary
     logger.info("\n" + "="*80)
     logger.info("Evaluation Complete!")
     logger.info("="*80)
-    logger.info(f"Total samples processed: {len(samples)}")
-    logger.info(f"Total pairs: {len(pairs)}")
+    logger.info(f"Total samples: {len(samples)}")
+    logger.info(f"Total batches: {num_batches}")
     
-    # Log predictions
-    if 'dscript_prediction' in output_df.columns and not output_df['dscript_prediction'].isna().all():
-        valid_preds = output_df['dscript_prediction'].dropna()
-        logger.info(f"D-SCRIPT prediction range: {valid_preds.min():.4f} - {valid_preds.max():.4f}")
-        logger.info(f"D-SCRIPT prediction mean: {valid_preds.mean():.4f}")
+    valid_preds = output_df['dscript_prediction'].dropna()
+    if len(valid_preds) > 0:
+        logger.info(f"Prediction range: {valid_preds.min():.4f} - {valid_preds.max():.4f}")
+        logger.info(f"Prediction mean: {valid_preds.mean():.4f}")
     
-    logger.info(f"CSV results saved to: {csv_output_file}")
-    logger.info(f"Detailed results saved to: {results_file}")
-    
-    # Upload results to GCS
+    # Upload to GCS
     gcs_bucket = "profluent-rweitzman"
     method_name = "dscript"
     gcs_base_path = f"gs://{gcs_bucket}/baseline_results/{method_name}/{dataset_name or 'custom'}"
     
     logger.info(f"\nUploading results to GCS: {gcs_base_path}")
     try:
-        # Upload CSV file
         csv_gcs_path = f"{gcs_base_path}/results.csv"
-        logger.info(f"Uploading {csv_output_file} -> {csv_gcs_path}")
         cmd = f"gcloud storage cp {shlex.quote(str(csv_output_file))} {shlex.quote(csv_gcs_path)}"
         subprocess.run(shlex.split(cmd), check=True)
-        logger.info(f"✓ Successfully uploaded CSV to {csv_gcs_path}")
+        logger.info(f"✓ Uploaded CSV to {csv_gcs_path}")
         
-        # Upload pickle file (optional, but useful for detailed analysis)
         pkl_gcs_path = f"{gcs_base_path}/ppi_results.pkl"
-        logger.info(f"Uploading {results_file} -> {pkl_gcs_path}")
         cmd = f"gcloud storage cp {shlex.quote(str(results_file))} {shlex.quote(pkl_gcs_path)}"
         subprocess.run(shlex.split(cmd), check=True)
-        logger.info(f"✓ Successfully uploaded pickle to {pkl_gcs_path}")
+        logger.info(f"✓ Uploaded pickle to {pkl_gcs_path}")
         
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to upload to GCS: {e}")
-        logger.error("Results are still saved locally")
     except Exception as e:
-        logger.error(f"Unexpected error uploading to GCS: {e}")
-        logger.error("Results are still saved locally")
+        logger.error(f"Failed to upload to GCS: {e}")
     
     logger.info("="*80)
 
 
 if __name__ == "__main__":
     main()
-
